@@ -114,10 +114,10 @@ where
 }
 
 #[derive(Clone)]
-pub(crate) struct ToolInfo {
-    pub(crate) server_name: String,
-    pub(crate) tool_name: String,
-    pub(crate) tool: Tool,
+pub struct ToolInfo {
+    pub server_name: String,
+    pub tool_name: String,
+    pub tool: Tool,
 }
 
 type ResponderMap = HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>;
@@ -261,7 +261,7 @@ pub struct SandboxState {
 
 /// A thin wrapper around a set of running [`RmcpClient`] instances.
 #[derive(Default)]
-pub(crate) struct McpConnectionManager {
+pub struct McpConnectionManager {
     clients: HashMap<String, AsyncManagedClient>,
     elicitation_requests: ElicitationRequestManager,
 }

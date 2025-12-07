@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::codex_tool_config::CodexToolCallParam;
 use crate::codex_tool_config::CodexToolCallReplyParam;
@@ -12,9 +13,14 @@ use codex_protocol::protocol::SessionSource;
 
 use codex_core::AuthManager;
 use codex_core::ConversationManager;
+use codex_core::McpConnectionManager;
 use codex_core::config::Config;
 use codex_core::default_client::USER_AGENT_SUFFIX;
 use codex_core::default_client::get_codex_user_agent;
+use codex_core::features::Feature;
+use codex_core::mcp::auth::compute_auth_statuses;
+use codex_core::mcp::split_qualified_tool_name;
+use codex_core::protocol::Event;
 use codex_core::protocol::Submission;
 use mcp_types::CallToolRequestParams;
 use mcp_types::CallToolResult;
@@ -34,7 +40,9 @@ use mcp_types::TextContent;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::task;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
@@ -42,6 +50,9 @@ pub(crate) struct MessageProcessor {
     codex_linux_sandbox_exe: Option<PathBuf>,
     conversation_manager: Arc<ConversationManager>,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ConversationId>>>,
+    running_proxy_requests: Arc<Mutex<HashMap<RequestId, tokio::task::JoinHandle<()>>>>,
+    mcp_connection_manager: Option<Arc<RwLock<McpConnectionManager>>>,
+    mcp_tool_proxy_enabled: bool,
 }
 
 impl MessageProcessor {
@@ -60,12 +71,42 @@ impl MessageProcessor {
         );
         let conversation_manager =
             Arc::new(ConversationManager::new(auth_manager, SessionSource::Mcp));
+        let mcp_tool_proxy_enabled = config.features.enabled(Feature::McpToolProxy)
+            && config.features.enabled(Feature::RmcpClient);
+        let mcp_connection_manager =
+            mcp_tool_proxy_enabled.then(|| Arc::new(RwLock::new(McpConnectionManager::default())));
+        if let Some(manager) = mcp_connection_manager.clone() {
+            let config = Arc::clone(&config);
+            let cancel_token = CancellationToken::new();
+            tokio::spawn(async move {
+                let (tx_event, rx_event) = async_channel::unbounded::<Event>();
+                drop(rx_event);
+                let auth_entries = compute_auth_statuses(
+                    config.mcp_servers.iter(),
+                    config.mcp_oauth_credentials_store_mode,
+                )
+                .await;
+                let mut guard = manager.write().await;
+                guard
+                    .initialize(
+                        config.mcp_servers.clone(),
+                        config.mcp_oauth_credentials_store_mode,
+                        auth_entries,
+                        tx_event,
+                        cancel_token,
+                    )
+                    .await;
+            });
+        }
         Self {
             outgoing,
             initialized: false,
             codex_linux_sandbox_exe,
             conversation_manager,
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
+            running_proxy_requests: Arc::new(Mutex::new(HashMap::new())),
+            mcp_connection_manager,
+            mcp_tool_proxy_enabled,
         }
     }
 
@@ -302,11 +343,23 @@ impl MessageProcessor {
         params: <mcp_types::ListToolsRequest as mcp_types::ModelContextProtocolRequest>::Params,
     ) {
         tracing::trace!("tools/list -> {params:?}");
+        let mut tools = vec![
+            create_tool_for_codex_tool_call_param(),
+            create_tool_for_codex_tool_call_reply_param(),
+        ];
+
+        if self.mcp_tool_proxy_enabled {
+            if let Some(manager) = self.mcp_connection_manager.clone() {
+                let guard = manager.read().await;
+                let mcp_tools = guard.list_all_tools().await;
+                tools.extend(mcp_tools.into_values().map(|tool| tool.tool));
+            } else {
+                tracing::debug!("MCP tool proxy enabled but manager not initialized");
+            }
+        }
+
         let result = ListToolsResult {
-            tools: vec![
-                create_tool_for_codex_tool_call_param(),
-                create_tool_for_codex_tool_call_reply_param(),
-            ],
+            tools,
             next_cursor: None,
         };
 
@@ -329,6 +382,14 @@ impl MessageProcessor {
                     .await
             }
             _ => {
+                if self.mcp_tool_proxy_enabled
+                    && self
+                        .handle_mcp_tool_proxy(id.clone(), name.clone(), arguments.clone())
+                        .await
+                {
+                    return;
+                }
+
                 let result = CallToolResult {
                     content: vec![ContentBlock::TextContent(TextContent {
                         r#type: "text".to_string(),
@@ -342,6 +403,101 @@ impl MessageProcessor {
                     .await;
             }
         }
+    }
+
+    async fn handle_mcp_tool_proxy(
+        &self,
+        id: RequestId,
+        name: String,
+        arguments: Option<serde_json::Value>,
+    ) -> bool {
+        let Some(manager) = self.mcp_connection_manager.clone() else {
+            return false;
+        };
+
+        let Some((server_name, tool_name)) = self
+            .resolve_mcp_tool(&manager, &name)
+            .await
+            .or_else(|| split_qualified_tool_name(&name))
+        else {
+            return false;
+        };
+
+        let outgoing = self.outgoing.clone();
+        let running_proxy_requests = self.running_proxy_requests.clone();
+
+        let map_id = id.clone();
+        let task_id = id.clone();
+        let task = tokio::spawn(async move {
+            let start_time = Instant::now();
+            let result = {
+                let guard = manager.read().await;
+                guard.call_tool(&server_name, &tool_name, arguments).await
+            };
+
+            match result {
+                Ok(result) => {
+                    tracing::info!(
+                        tool = name,
+                        server = server_name,
+                        duration_ms = start_time.elapsed().as_millis() as i64,
+                        "Forwarded MCP tool call completed"
+                    );
+                    outgoing.send_response(task_id.clone(), result).await;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        tool = name,
+                        server = server_name,
+                        error = %err,
+                        "Forwarded MCP tool call failed"
+                    );
+                    let result = CallToolResult {
+                        content: vec![ContentBlock::TextContent(TextContent {
+                            r#type: "text".to_string(),
+                            text: format!("Failed to call {name}: {err}"),
+                            annotations: None,
+                        })],
+                        is_error: Some(true),
+                        structured_content: None,
+                    };
+                    outgoing.send_response(task_id.clone(), result).await;
+                }
+            }
+
+            running_proxy_requests.lock().await.remove(&task_id);
+        });
+
+        self.running_proxy_requests
+            .lock()
+            .await
+            .insert(map_id, task);
+
+        true
+    }
+
+    async fn resolve_mcp_tool(
+        &self,
+        manager: &Arc<RwLock<McpConnectionManager>>,
+        name: &str,
+    ) -> Option<(String, String)> {
+        let guard = manager.read().await;
+        guard.parse_tool_name(name).await
+    }
+
+    async fn cancel_proxy_request(&self, request_id: &RequestId) -> bool {
+        let handle = {
+            let mut guard = self.running_proxy_requests.lock().await;
+            guard.remove(request_id)
+        };
+
+        if let Some(handle) = handle {
+            tracing::info!(?request_id, "Cancelling proxied MCP tool call");
+            handle.abort();
+            return true;
+        }
+
+        false
     }
     async fn handle_tool_call_codex(&self, id: RequestId, arguments: Option<serde_json::Value>) {
         let (initial_prompt, config): (String, Config) = match arguments {
@@ -558,6 +714,9 @@ impl MessageProcessor {
         params: <mcp_types::CancelledNotification as mcp_types::ModelContextProtocolNotification>::Params,
     ) {
         let request_id = params.request_id;
+        if self.cancel_proxy_request(&request_id).await {
+            return;
+        }
         // Create a stable string form early for logging and submission id.
         let request_id_string = match &request_id {
             RequestId::String(s) => s.clone(),
