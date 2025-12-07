@@ -1419,6 +1419,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "async-channel",
  "codex-arg0",
  "codex-common",
  "codex-core",
@@ -1435,6 +1436,7 @@ dependencies = [
  "shlex",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "wiremock",

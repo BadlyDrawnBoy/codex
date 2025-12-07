@@ -58,6 +58,8 @@ pub enum Feature {
     ParallelToolCalls,
     /// Experimental skills injection (CLI flag-driven).
     Skills,
+    /// Proxy MCP tools through the Codex MCP server.
+    McpToolProxy,
 }
 
 impl Feature {
@@ -342,6 +344,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Skills,
         key: "skills",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::McpToolProxy,
+        key: "mcp_tool_proxy",
         stage: Stage::Experimental,
         default_enabled: false,
     },
